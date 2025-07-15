@@ -48,6 +48,11 @@
 #define TICK_TIMER_PERIOD 10
 #define ROLLOVER_DELAY_PERIOD 7
 
+// Screen timeout configuration
+#define IDLE_TIMEOUT_SECONDS 30        // Time before entering sleep mode
+#define IDLE_TIMEOUT_TICKS (IDLE_TIMEOUT_SECONDS * 1000 / TICK_TIMER_PERIOD)  // Convert to timer ticks
+
+
 
 uint8_t jog_color[] = {0,255,0};
 uint8_t halt_color[] = {0,255,0};
@@ -66,6 +71,13 @@ static const uint I2C_BAUDRATE = 100000; // 100 kHz
 // GPIO pins to use for I2C SLAVE
 static const uint I2C_SLAVE_SDA_PIN = 0;
 static const uint I2C_SLAVE_SCL_PIN = 1;
+
+// Screen timeout state variables
+static bool sleep_mode = false;
+static int idle_counter = 0;
+static machine_status_packet_t last_valid_packet;
+static bool last_packet_valid = false;
+
 
 // RPI Pico
 
@@ -149,6 +161,12 @@ ScreenMode previous_screenmode = DEFAULT;
 
 char *ram_ptr = (char*) &context.mem[0];
 int character_sent;
+
+// Forward declarations
+bool isValidPacketReceived();
+bool anyButtonPressed();
+void enterSleepMode();
+void wakeFromSleep();
 
 // Our handler is called from the I2C ISR, so it must complete quickly. Blocking calls /
 // printing to stdio may interfere with interrupt handling.
@@ -715,34 +733,128 @@ static void draw_main_screen(bool force){
   previous_screenmode = screenmode;  
 }//close draw main screen
 
+// Function to check if we received new/valid data
+bool isValidPacketReceived() {
+    // Check if we have a complete packet and it's not a disconnection status
+    if (context.mem_address >= sizeof(machine_status_packet_t) && 
+        packet->status_code != Status_UserException) {
+        
+        // Check if packet data has changed (indicating active connection)
+        if (!last_packet_valid || 
+            memcmp(packet, &last_valid_packet, sizeof(machine_status_packet_t)) != 0) {
+            
+            // Store the current packet as the last valid one
+            memcpy(&last_valid_packet, packet, sizeof(machine_status_packet_t));
+            last_packet_valid = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Function to enter sleep mode
+void enterSleepMode() {
+    if (!sleep_mode) {
+        sleep_mode = true;
+        
+        // Turn off OLED display
+        oledPower(&oled, false);  // Turn off completely
+        // Alternative: just blank the screen but keep it powered
+        // oledFill(&oled, 0, 1);
+        
+        // Turn off all LEDs
+        pixels.clear();
+        pixels.show();
+        
+        // Optional: Turn off onboard LED too
+        gpio_put(ONBOARD_LED, 0);
+        
+        printf("Entering sleep mode due to inactivity\n");
+    }
+}
+
+// Function to wake up from sleep mode
+void wakeFromSleep() {
+    if (sleep_mode) {
+        sleep_mode = false;
+        idle_counter = 0;
+        
+        // Turn OLED back on
+        oledPower(&oled, true);
+        
+        // Force a screen update
+        draw_main_screen(1);
+        
+        // LEDs will be updated in the next update cycle
+        update_neopixel_leds = 1;
+        
+        printf("Waking from sleep mode\n");
+    }
+}
+
+// Function to check for any button activity
+bool anyButtonPressed() {
+    return (gpio_get(HALTBUTTON) || gpio_get(HOLDBUTTON) || gpio_get(RUNBUTTON) ||
+            gpio_get(SPINOVER_UP) || gpio_get(SPINOVER_DOWN) || gpio_get(SPINOVER_RESET) ||
+            gpio_get(FEEDOVER_UP) || gpio_get(FEEDOVER_DOWN) || gpio_get(FEEDOVER_RESET) ||
+            gpio_get(HOMEBUTTON) || gpio_get(MISTBUTTON) || gpio_get(FLOODBUTTON) ||
+            gpio_get(SPINDLEBUTTON) || gpio_get(JOG_SELECT) || gpio_get(UPBUTTON) ||
+            gpio_get(RIGHTBUTTON) || gpio_get(DOWNBUTTON) || gpio_get(LEFTBUTTON) ||
+            gpio_get(RAISEBUTTON) || gpio_get(LOWERBUTTON));
+}
+
+// Modified timer callback to include idle tracking
 bool tick_timer_callback(struct repeating_timer *t) {
-    if (onboard_led_count == 0){
-    //gpio_put(ONBOARD_LED, !gpio_get_out_level(ONBOARD_LED));                // toggle the LED
-    onboard_led_count = 20;  //thi ssets the heartbeat
-    }else{
-    onboard_led_count = onboard_led_count - 1;
+    // Existing heartbeat code
+    if (onboard_led_count == 0) {
+        if (!sleep_mode) {  // Only blink LED when not in sleep mode
+            gpio_put(ONBOARD_LED, !gpio_get_out_level(ONBOARD_LED));
+        }
+        onboard_led_count = 20;
+    } else {
+        onboard_led_count = onboard_led_count - 1;
     }
 
     status_update_counter = status_update_counter - 1;
-    if (status_update_counter < 0){
-      status_update_counter = 0;
+    if (status_update_counter < 0) {
+        status_update_counter = 0;
     }
 
     led_update_counter = led_update_counter - 1;
-    if (led_update_counter <= 0){
+    if (led_update_counter <= 0) {
         update_neopixel_leds = 1;
         led_update_counter = LED_UPDATE_PERIOD;
     }
 
-    if(direction_pressed){
-      rollover_delay++;
-      if(rollover_delay > ROLLOVER_DELAY_PERIOD)
-        rollover_delay = ROLLOVER_DELAY_PERIOD;
+    // Jogging related counters
+    if(direction_pressed) {
+        rollover_delay++;
+        if(rollover_delay > ROLLOVER_DELAY_PERIOD)
+            rollover_delay = ROLLOVER_DELAY_PERIOD;
 
-      transition_delay = transition_delay - 1;
-      if(transition_delay < 0)
-        transition_delay = 0;
-    }       
+        transition_delay = transition_delay - 1;
+        if(transition_delay < 0)
+            transition_delay = 0;
+    }
+
+    // Power saving logic
+    if (isValidPacketReceived() || anyButtonPressed()) {
+        // Reset idle counter if we have activity
+        idle_counter = 0;
+        
+        // Wake up if we were sleeping
+        if (sleep_mode) {
+            wakeFromSleep();
+        }
+    } else {
+        // Increment idle counter
+        idle_counter++;
+        
+        // Check if we should enter sleep mode
+        if (idle_counter >= IDLE_TIMEOUT_TICKS && !sleep_mode) {
+            enterSleepMode();
+        }
+    }
     
     return true;
 }
@@ -910,33 +1022,35 @@ draw_main_screen(1);
         //   current_jogmodify =  (Jogmodify) (packet->jog_mode.modifier);
         // }
 
-        if( packet->machine_state != previous_packet->machine_state ||
-            packet->feed_override != previous_packet->feed_override ||
-            packet->spindle_override != previous_packet->spindle_override||
-            packet->jog_mode.value != previous_packet->jog_mode.value ||
-            packet->coordinate.x != previous_packet->coordinate.x ||
-            packet->coordinate.y != previous_packet->coordinate.y ||
-            packet->coordinate.z != previous_packet->coordinate.z ||
-            packet->coordinate.a != previous_packet->coordinate.a ||                  
-            packet->current_wcs != previous_packet->current_wcs ||
-            packet->jog_stepsize != previous_packet->jog_stepsize ||
-            packet->feed_rate != previous_packet->feed_rate ||
-            packet->spindle_rpm != previous_packet->spindle_rpm ||
-            packet->jog_mode.modifier != previous_packet->jog_mode.modifier ||
-            screenmode != previous_screenmode
-            ){          
-          draw_main_screen(1);        
+        if (!sleep_mode) {  // Only update screen when not sleeping
+            if( packet->machine_state != previous_packet->machine_state ||
+                packet->feed_override != previous_packet->feed_override ||
+                packet->spindle_override != previous_packet->spindle_override||
+                packet->jog_mode.value != previous_packet->jog_mode.value ||
+                packet->coordinate.x != previous_packet->coordinate.x ||
+                packet->coordinate.y != previous_packet->coordinate.y ||
+                packet->coordinate.z != previous_packet->coordinate.z ||
+                packet->coordinate.a != previous_packet->coordinate.a ||                  
+                packet->current_wcs != previous_packet->current_wcs ||
+                packet->jog_stepsize != previous_packet->jog_stepsize ||
+                packet->feed_rate != previous_packet->feed_rate ||
+                packet->spindle_rpm != previous_packet->spindle_rpm ||
+                packet->jog_mode.modifier != previous_packet->jog_mode.modifier ||
+                screenmode != previous_screenmode
+                ){          
+              draw_main_screen(1);        
+            }
         }
 
         //if(screenmode != previous_screenmode)
         //  draw_main_screen(1);
         
-        if(packet->machine_state == MachineState_Jog){
+        if(packet->machine_state == MachineState_Jog && !sleep_mode) {
           draw_main_screen(1);
           update_neopixels();
         }
 
-        if (update_neopixel_leds && (packet->status_code != Status_UserException) ){
+        if (update_neopixel_leds && (packet->status_code != Status_UserException) && !sleep_mode) {
           if(context.mem_address >= offsetof(machine_status_packet_t, msgtype))          
             update_neopixels();
           update_neopixel_leds = 0;
