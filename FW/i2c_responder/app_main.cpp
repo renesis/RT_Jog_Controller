@@ -515,7 +515,8 @@ static void draw_main_screen(bool force){
     }
     
     oledWriteString(&oled, 0, 0, 4, charbuf, FONT_8x8, 0, 1);
-    oledWriteString(&oled, 0, 0, 6, (char *)"Feed +/- to adjust", FONT_6x8, 0, 1);
+    oledWriteString(&oled, 0, 0, 5, (char *)"Spin Reset: +", FONT_6x8, 0, 1);
+    oledWriteString(&oled, 0, 0, 6, (char *)"Feed Reset: -", FONT_6x8, 0, 1);
     return;
   }
 
@@ -1668,6 +1669,26 @@ draw_main_screen(1);
             sleep_ms(10);
             update_neopixels();                
         }}
+        if (feed_down_fine_pressed) {
+          if (gpio_get(FEEDOVER_DOWN)){}//button is still pressed, do nothing
+          else{
+            key_character = CMD_OVERRIDE_FEED_FINE_MINUS;
+            keypad_sendchar (key_character, 1, 1);
+            gpio_put(ONBOARD_LED,1);
+            feed_down_fine_pressed = 0;
+            sleep_ms(10);
+            update_neopixels();                       
+         }}
+        if (feed_up_fine_pressed) {
+          if (gpio_get(FEEDOVER_UP)){}//button is still pressed, do nothing
+          else{
+            key_character = CMD_OVERRIDE_FEED_FINE_PLUS;
+            keypad_sendchar (key_character, 1, 1);
+            gpio_put(ONBOARD_LED,1);
+            feed_up_fine_pressed = 0;
+            sleep_ms(10);
+            update_neopixels();                
+        }}
         if (spin_down_fine_pressed) {
           if (gpio_get(SPINOVER_DOWN)){}//button is still pressed, do nothing
           else{
@@ -1699,7 +1720,7 @@ draw_main_screen(1);
             update_neopixels();           
         }}
         if (timeout_up_pressed) {
-          if (gpio_get(FEEDOVER_UP)){}//button is still pressed, do nothing
+          if (gpio_get(SPINOVER_RESET)){}//button is still pressed, do nothing
           else{
             adjusting_timeout = true;
             timeout_display_counter = 300; // Show for 3 seconds
@@ -1724,7 +1745,7 @@ draw_main_screen(1);
             sleep_ms(10);
         }}
         if (timeout_down_pressed) {
-          if (gpio_get(FEEDOVER_DOWN)){}//button is still pressed, do nothing
+          if (gpio_get(FEEDOVER_RESET)){}//button is still pressed, do nothing
           else{
             adjusting_timeout = true;
             timeout_display_counter = 300; // Show for 3 seconds
