@@ -49,8 +49,20 @@
 #define ROLLOVER_DELAY_PERIOD 7
 
 // Screen timeout configuration
-#define IDLE_TIMEOUT_SECONDS 30        // Time before entering sleep mode
-#define IDLE_TIMEOUT_TICKS (IDLE_TIMEOUT_SECONDS * 1000 / TICK_TIMER_PERIOD)  // Convert to timer ticks
+#define DEFAULT_IDLE_TIMEOUT_SECONDS 30   // Default timeout
+#define MIN_IDLE_TIMEOUT_SECONDS 5        // Minimum timeout  
+#define MAX_IDLE_TIMEOUT_SECONDS 1800     // Maximum timeout (30 minutes)
+#define TICK_TIMER_PERIOD 10
+
+// Flash storage offsets
+#define FLASH_TARGET_OFFSET (256 * 1024)    // Screen flip setting
+#define TIMEOUT_FLASH_OFFSET (256 * 1024 + FLASH_SECTOR_SIZE)  // Timeout setting
+// Note: flash_target_contents is defined in i2c_jogger.h
+const uint8_t *timeout_flash_contents = (const uint8_t *) (XIP_BASE + TIMEOUT_FLASH_OFFSET);
+
+// Variable timeout settings
+static uint16_t idle_timeout_seconds = DEFAULT_IDLE_TIMEOUT_SECONDS;
+static uint32_t idle_timeout_ticks = (DEFAULT_IDLE_TIMEOUT_SECONDS * 1000 / TICK_TIMER_PERIOD);
 
 
 
@@ -151,6 +163,12 @@ uint8_t reset_pressed = 0;
 uint8_t unlock_pressed = 0;
 uint8_t halt_pressed = 0;
 uint8_t spinon_pressed = 0;
+uint8_t timeout_up_pressed = 0;
+uint8_t timeout_down_pressed = 0;
+
+// Timeout adjustment state
+static bool adjusting_timeout = false;
+static int timeout_display_counter = 0;
 
 machine_status_packet_t *packet = (machine_status_packet_t*) context.mem;
 machine_status_packet_t prev_packet;
@@ -252,6 +270,10 @@ uint8_t keypad_sendchar (uint8_t character, bool clearpin, bool update_status) {
 static void update_neopixels(void){
 
   if (context.mem_address < offsetof(machine_status_packet_t, msgtype))
+    return;
+    
+  // Don't update LEDs when in sleep mode
+  if (sleep_mode)
     return;
   
   //set override LEDS
@@ -469,6 +491,33 @@ static void draw_main_screen(bool force){
   #define INFOLINE 0
   #define BOTTOMLINE 7
   #define INFOFONT FONT_8x8
+
+  // If adjusting timeout, show timeout screen
+  if (adjusting_timeout) {
+    oledFill(&oled, 0, 1);
+    oledWriteString(&oled, 0, 0, 2, (char *)"SLEEP TIMEOUT", FONT_8x8, 0, 1);
+    
+    // Display timeout in appropriate format
+    if (idle_timeout_seconds < 60) {
+      sprintf(charbuf, "%d seconds", idle_timeout_seconds);
+    } else if (idle_timeout_seconds < 3600) {
+      int minutes = idle_timeout_seconds / 60;
+      int seconds = idle_timeout_seconds % 60;
+      if (seconds == 0) {
+        sprintf(charbuf, "%d minutes", minutes);
+      } else {
+        sprintf(charbuf, "%dm %ds", minutes, seconds);
+      }
+    } else {
+      int hours = idle_timeout_seconds / 3600;
+      int minutes = (idle_timeout_seconds % 3600) / 60;
+      sprintf(charbuf, "%dh %dm", hours, minutes);
+    }
+    
+    oledWriteString(&oled, 0, 0, 4, charbuf, FONT_8x8, 0, 1);
+    oledWriteString(&oled, 0, 0, 6, (char *)"Feed +/- to adjust", FONT_6x8, 0, 1);
+    return;
+  }
 
   //while(context.mem_address < sizeof(Machine_status_packet));
 
@@ -851,8 +900,16 @@ bool tick_timer_callback(struct repeating_timer *t) {
         idle_counter++;
         
         // Check if we should enter sleep mode
-        if (idle_counter >= IDLE_TIMEOUT_TICKS && !sleep_mode) {
+        if (idle_counter >= idle_timeout_ticks && !sleep_mode) {
             enterSleepMode();
+        }
+    }
+    
+    // Decrement timeout display counter
+    if (timeout_display_counter > 0) {
+        timeout_display_counter--;
+        if (timeout_display_counter == 0) {
+            adjusting_timeout = false;
         }
     }
     
@@ -990,12 +1047,23 @@ int main() {
 // Setup I2C0 as slave (peripheral)
 setup_slave();
 packet->status_code = Status_UserException; // ADD STATUS FOR CONTROLLER DISCONNECTED?
+
+// Initialize coordinate values to NaN for machines without all axes
+packet->coordinate.a = NAN;
+
 key_character = CMD_STATUS_REPORT_LEGACY;
 //keypad_sendchar (key_character, 1, 1);
 status_update_counter = STATUS_REQUEST_PERIOD;
 
 if (*flash_target_contents != 0xff)
   screenflip = *flash_target_contents;
+
+// Load timeout setting from flash
+if (*timeout_flash_contents != 0xff && *(uint16_t*)timeout_flash_contents >= MIN_IDLE_TIMEOUT_SECONDS && 
+    *(uint16_t*)timeout_flash_contents <= MAX_IDLE_TIMEOUT_SECONDS) {
+  idle_timeout_seconds = *(uint16_t*)timeout_flash_contents;
+  idle_timeout_ticks = (idle_timeout_seconds * 1000) / TICK_TIMER_PERIOD;
+}
 
 uint8_t uc[8];
 int i, j;
@@ -1619,6 +1687,66 @@ draw_main_screen(1);
             spin_up_fine_pressed = 0;
             sleep_ms(10);
             update_neopixels();
+        }}
+        if (spin_down_fine_pressed) {
+          if (gpio_get(SPINOVER_DOWN)){}//button is still pressed, do nothing
+          else{
+            key_character = CMD_OVERRIDE_SPINDLE_FINE_MINUS;
+            keypad_sendchar (key_character, 1, 1);
+            gpio_put(ONBOARD_LED,1);
+            spin_down_fine_pressed = 0;
+            sleep_ms(10);
+            update_neopixels();           
+        }}
+        if (timeout_up_pressed) {
+          if (gpio_get(FEEDOVER_UP)){}//button is still pressed, do nothing
+          else{
+            adjusting_timeout = true;
+            timeout_display_counter = 300; // Show for 3 seconds
+            if (idle_timeout_seconds < MAX_IDLE_TIMEOUT_SECONDS) {
+              if (idle_timeout_seconds < 60) {
+                idle_timeout_seconds += 5;  // 5 second increments under 1 minute
+              } else if (idle_timeout_seconds < 300) {
+                idle_timeout_seconds += 30; // 30 second increments from 1-5 minutes
+              } else {
+                idle_timeout_seconds += 60; // 1 minute increments over 5 minutes
+              }
+              idle_timeout_ticks = (idle_timeout_seconds * 1000) / TICK_TIMER_PERIOD;
+              
+              // Save to flash
+              uint32_t status = save_and_disable_interrupts();
+              flash_range_erase(TIMEOUT_FLASH_OFFSET, FLASH_SECTOR_SIZE);
+              restore_interrupts(status);
+              sleep_ms(10);
+              flash_range_program(TIMEOUT_FLASH_OFFSET, (uint8_t*)&idle_timeout_seconds, sizeof(idle_timeout_seconds));
+            }
+            timeout_up_pressed = 0;
+            sleep_ms(10);
+        }}
+        if (timeout_down_pressed) {
+          if (gpio_get(FEEDOVER_DOWN)){}//button is still pressed, do nothing
+          else{
+            adjusting_timeout = true;
+            timeout_display_counter = 300; // Show for 3 seconds
+            if (idle_timeout_seconds > MIN_IDLE_TIMEOUT_SECONDS) {
+              if (idle_timeout_seconds <= 60) {
+                idle_timeout_seconds -= 5;  // 5 second increments under 1 minute
+              } else if (idle_timeout_seconds <= 300) {
+                idle_timeout_seconds -= 30; // 30 second increments from 1-5 minutes
+              } else {
+                idle_timeout_seconds -= 60; // 1 minute increments over 5 minutes
+              }
+              idle_timeout_ticks = (idle_timeout_seconds * 1000) / TICK_TIMER_PERIOD;
+              
+              // Save to flash
+              uint32_t status = save_and_disable_interrupts();
+              flash_range_erase(TIMEOUT_FLASH_OFFSET, FLASH_SECTOR_SIZE);
+              restore_interrupts(status);
+              sleep_ms(10);
+              flash_range_program(TIMEOUT_FLASH_OFFSET, (uint8_t*)&idle_timeout_seconds, sizeof(idle_timeout_seconds));
+            }
+            timeout_down_pressed = 0;
+            sleep_ms(10);
         }}  
         if (halt_pressed){
           if (gpio_get(HALTBUTTON)){
