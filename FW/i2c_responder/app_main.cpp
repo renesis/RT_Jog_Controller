@@ -789,6 +789,13 @@ bool isValidPacketReceived() {
     if (context.mem_address >= sizeof(machine_status_packet_t) && 
         packet->status_code != Status_UserException) {
         
+        // Always stay awake during active machine states
+        if (packet->machine_state == MachineState_Cycle ||
+            packet->machine_state == MachineState_Jog ||
+            packet->machine_state == MachineState_Homing) {
+            return true;
+        }
+        
         // Check if packet data has changed (indicating active connection)
         if (!last_packet_valid || 
             memcmp(packet, &last_valid_packet, sizeof(machine_status_packet_t)) != 0) {
