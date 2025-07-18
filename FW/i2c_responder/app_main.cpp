@@ -789,14 +789,19 @@ bool isValidPacketReceived() {
     if (context.mem_address >= sizeof(machine_status_packet_t) && 
         packet->status_code != Status_UserException) {
         
-        // Always stay awake during active machine states
+        // Always stay awake during active machine states - check this first
         if (packet->machine_state == MachineState_Cycle ||
             packet->machine_state == MachineState_Jog ||
-            packet->machine_state == MachineState_Homing) {
+            packet->machine_state == MachineState_Homing ||
+            packet->machine_state == MachineState_Hold ||
+            packet->machine_state == MachineState_ToolChange) {
+            // Update the last valid packet even if data hasn't changed
+            memcpy(&last_valid_packet, packet, sizeof(machine_status_packet_t));
+            last_packet_valid = true;
             return true;
         }
         
-        // Check if packet data has changed (indicating active connection)
+        // For idle states, check if packet data has changed (indicating active connection)
         if (!last_packet_valid || 
             memcmp(packet, &last_valid_packet, sizeof(machine_status_packet_t)) != 0) {
             
@@ -1406,9 +1411,11 @@ draw_main_screen(1);
         if (feed_reset_pressed) {
           if (gpio_get(FEEDOVER_RESET)){}//button is still pressed, do nothing
           else{
-            key_character = CMD_OVERRIDE_FEED_RESET;
-            keypad_sendchar (key_character, 1, 1);
-            gpio_put(ONBOARD_LED,1);
+            if(!jog_toggle_pressed){  // Only do normal reset function when NOT in function mode
+              key_character = CMD_OVERRIDE_FEED_RESET;
+              keypad_sendchar (key_character, 1, 1);
+              gpio_put(ONBOARD_LED,1);
+            }
             feed_reset_pressed = 0;
             update_neopixels();                
           }
@@ -1436,9 +1443,11 @@ draw_main_screen(1);
         if (spin_reset_pressed) {
           if (gpio_get(SPINOVER_RESET)){}//button is still pressed, do nothing
           else{
-            key_character = CMD_OVERRIDE_SPINDLE_RESET;
-            keypad_sendchar (key_character, 1, 1);
-            gpio_put(ONBOARD_LED,1);
+            if(!jog_toggle_pressed){  // Only do normal reset function when NOT in function mode
+              key_character = CMD_OVERRIDE_SPINDLE_RESET;
+              keypad_sendchar (key_character, 1, 1);
+              gpio_put(ONBOARD_LED,1);
+            }
             spin_reset_pressed = 0;
             update_neopixels();          
           }
